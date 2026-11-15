@@ -23,7 +23,11 @@ pub fn new_editor_window_label() -> String {
     format!("main{}", Uuid::new_v4().simple())
 }
 
+/// 지정 레이블의 일반 편집 창을 생성한다. 보호 프로세스의 권한 확장은 거부한다.
 pub fn create_editor_window_with_label(app: &AppHandle, label: &str) -> Result<(), String> {
+    if app.state::<crate::state::AppState>().protected {
+        return Err(crate::managed_document::RESTRICTED.into());
+    }
     let geometry = new_window_geometry(app);
 
     let builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))

@@ -16,6 +16,7 @@ import { editCommands } from '@/command/commands/edit';
 import { fileCommands } from '@/command/commands/file';
 import { assertUniqueCommandIds } from '../command/replace-upstream-commands';
 import { toolbarLabelsCommand } from './toolbar-labels';
+import { protectCommand } from '../core/protected-document';
 
 interface CommandRuntimeDependencies {
   wasm: WasmBridge;
@@ -50,6 +51,7 @@ const commandContributions: readonly CommandDef[][] = [
 
 assertUniqueCommandIds(commandContributions);
 
+/** 편집기 의존성을 받아 보호 정책을 적용한 명령 레지스트리와 실행 서비스를 반환한다. */
 export function createCommandRuntime(dependencies: CommandRuntimeDependencies): CommandRuntime {
   const { wasm, eventBus, documentState, getInputHandler, getCanvasView, setStatusMessage } = dependencies;
   const registry = new CommandRegistry();
@@ -111,7 +113,7 @@ export function createCommandRuntime(dependencies: CommandRuntimeDependencies): 
     setEditMode,
   };
   const dispatcher = new CommandDispatcher(registry, services, eventBus);
-  for (const commands of commandContributions) registry.registerAll(commands);
+  for (const commands of commandContributions) registry.registerAll(commands.map(protectCommand));
 
   return { registry, dispatcher, services, getEditMode: () => editMode };
 }

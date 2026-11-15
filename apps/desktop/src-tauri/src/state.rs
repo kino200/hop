@@ -106,6 +106,8 @@ pub struct DocumentSessionManager {
 
 #[derive(Default)]
 pub struct AppState {
+    pub protected: bool,
+    pub managed: Mutex<crate::managed_document::ManagedDocuments>,
     pub sessions: Mutex<DocumentSessionManager>,
     pub(crate) pending_open_paths: PendingOpenPaths,
     pub quit_requests: Mutex<crate::app_quit::AppQuitState>,
@@ -113,6 +115,54 @@ pub struct AppState {
 }
 
 impl DocumentSessionManager {
+    /// 보호 문서 ID와 암호문 경로의 추적 상태만 만들고 평문 코어나 파일은 생성하지 않는다.
+    pub(crate) fn track_managed(
+        &mut self,
+        doc_id: String,
+        path: Option<PathBuf>,
+    ) -> DocumentOpenResult {
+        let name = path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|p| p.to_str())
+            .unwrap_or("새 문서.hwpx")
+            .to_string();
+        let session = DocumentSession {
+            doc_id: doc_id.clone(),
+            source_path: path,
+            source_format: DocumentFormat::Hwpx,
+            source_fingerprint: None,
+            dirty: false,
+            revision: 1,
+            page_count: 0,
+            core: None,
+            page_svg_cache: HashMap::new(),
+        };
+        let result = session.open_result(name);
+        self.sessions.insert(doc_id.clone(), session);
+        self.active_doc_id = Some(doc_id);
+        result
+    }
+
+    /// 보호 문서의 요청 ID·수정 버전을 검사해 저장 전 충돌을 거부한다.
+    pub(crate) fn check_managed_save(&mut self, doc_id: &str, revision: u64) -> Result<(), String> {
+        self.session_mut(doc_id)?.check_revision(Some(revision))
+    }
+
+    /// 암호문 저장이 성공한 문서의 추적 상태만 갱신하고 저장 결과를 반환한다.
+    pub(crate) fn finish_managed_save(
+        &mut self,
+        doc_id: &str,
+        path: PathBuf,
+    ) -> Result<SaveResult, String> {
+        let session = self.session_mut(doc_id)?;
+        session.source_path = Some(path);
+        session.source_format = DocumentFormat::Hwpx;
+        session.revision = session.revision.saturating_add(1);
+        session.dirty = false;
+        Ok(session.save_result())
+    }
+
     pub fn create_document(&mut self) -> Result<DocumentOpenResult, String> {
         let mut core = DocumentCore::new_empty();
         core.create_blank_document_native()

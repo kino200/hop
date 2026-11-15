@@ -28,6 +28,9 @@ import { HomeScreen } from '@/ui/home-screen';
 import type { DesktopBridgeApi } from '@/core/tauri-bridge';
 import { createCommandRuntime } from './host/command-runtime';
 import { createRendererSession } from './host/renderer-session';
+import { installProtectedDocumentGuards, isProtectedDocument } from './core/protected-document';
+
+installProtectedDocumentGuards();
 
 const wasm = createBridge();
 const eventBus = new EventBus();
@@ -79,6 +82,7 @@ document.addEventListener(MODAL_DIALOG_CLOSED_EVENT, () => {
   if (inputHandler?.isActive()) inputHandler.focus();
 });
 
+/** 인자 없이 편집 화면을 초기화한다. 보호 창에서는 저장된 사용자 글꼴을 읽지 않는다. */
 async function initialize(): Promise<void> {
   const msg = sbMessage();
   try {
@@ -86,7 +90,7 @@ async function initialize(): Promise<void> {
     desktopPlatform = await hydrateDesktopPlatform();
     applyDesktopChromePlatformState(document, desktopPlatform);
     msg.textContent = '웹폰트 로딩 중...';
-    await loadStoredLocalFonts().catch(() => null);
+    if (!isProtectedDocument()) await loadStoredLocalFonts().catch(() => null);
     await loadWebFonts([]);  // CSS @font-face 등록 + CRITICAL 폰트만 로드
     msg.textContent = '문서 엔진 로딩 중...';
     await wasm.initialize();
@@ -287,10 +291,12 @@ function setupGlobalShortcuts(): void {
   }, false);
 }
 
+/** 파일 선택 이벤트를 연결한다. 보호 창의 브라우저 파일 입력은 거부하며 반환값은 없다. */
 function setupFileInput(): void {
   const fileInput = document.getElementById('file-input') as HTMLInputElement;
 
   fileInput.addEventListener('change', async (e) => {
+    if (isProtectedDocument()) { fileInput.value = ''; return; }
     const input = e.target as HTMLInputElement;
     const skipUnsavedGuard = input.dataset.skipUnsavedGuard === 'true';
     delete input.dataset.skipUnsavedGuard;

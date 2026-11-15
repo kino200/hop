@@ -2,6 +2,7 @@ import { WasmBridge } from '@/upstream/core';
 import type { DocumentInfo } from '@/upstream/core';
 import { remove, stat } from '@tauri-apps/plugin-fs';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { isProtectedDocument, PROTECTED_MESSAGE } from './protected-document';
 import { finiteFileSize, readFileInChunks, writeFileInChunks } from './chunked-fs';
 import { loadDocumentForOpen } from './document-open';
 
@@ -119,8 +120,16 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     return this.withDocumentOperation(() => this.openDocumentPath(path));
   }
 
+  /** 경로를 먼저 네이티브 보호 경계에서 검사하고 보호 본문은 메모리로만 로드한다. */
   private async openDocumentPath(path: string): Promise<DesktopLoadPayload | null> {
     if (!(await this.confirmReadyForDocumentReplacement())) return null;
+
+    const managed = await this.invoke<{ document?: NativeOpenResult; bytes: number[]; redirected: boolean } | null>(
+      'open_managed_document', { path },
+    );
+    if (managed?.redirected) return null;
+    if (managed?.document) return this.loadManagedDocument(managed.document, managed.bytes);
+    if (isProtectedDocument()) throw new Error(PROTECTED_MESSAGE);
 
     await this.invoke<void>('prepare_document_open', { path });
     const { bytes, sourceFingerprint } = await this.readFileForOpen(path);
@@ -149,6 +158,23 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     }
   }
 
+  /** 보호 메모리 바이트를 WASM으로 옮기고 전송용 복사본을 지운 뒤 추적 정보를 반영한다. */
+  private async loadManagedDocument(result: NativeOpenResult, values: number[]): Promise<DesktopLoadPayload> {
+    const bytes = new Uint8Array(values);
+    values.fill(0);
+    try {
+      const info = await loadDocumentForOpen(this, bytes, result.fileName);
+      if (!info) throw new Error('보호 HWPX 문서를 열지 못했습니다.');
+      this.applyNativeOpenResult(result, 'hwpx');
+      return { docInfo: info, message: `${result.fileName} — 보호 문서` };
+    } catch (error) {
+      await this.closeNativeDocument(result.docId);
+      throw error;
+    } finally {
+      bytes.fill(0);
+    }
+  }
+
   async takePendingOpenPaths(): Promise<string[]> {
     return this.invoke<string[]>('take_pending_open_paths');
   }
@@ -157,10 +183,11 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     return this.withDocumentOperation(() => this.createDocument());
   }
 
+  /** 현재 창의 보호 상태에 맞춰 새 문서를 만들고 네이티브 추적 정보를 반환한다. */
   private async createDocument(): Promise<DesktopLoadPayload | null> {
     if (!(await this.confirmReadyForDocumentReplacement())) return null;
 
-    const result = await this.invoke<NativeOpenResult>('create_document');
+    const result = await this.invoke<NativeOpenResult>(isProtectedDocument() ? 'create_managed_document' : 'create_document');
     const previousDocId = this.docId;
     try {
       const info = super.createNewDocument();
@@ -168,7 +195,7 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
       await this.closeReplacedDocument(previousDocId, result.docId);
       return {
         docInfo: info,
-        message: `새 문서.hwp — ${info.pageCount}페이지`,
+        message: `${result.fileName} — ${info.pageCount}페이지`,
       };
     } catch (error) {
       await this.closeNativeDocument(result.docId);
@@ -188,8 +215,10 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     return this.withDocumentOperation(() => this.saveDocument());
   }
 
+  /** 보호 창은 메모리 HWPX 암호화 저장을, 일반 창은 기존 HWP 저장을 수행한다. */
   private async saveDocument(): Promise<DesktopSaveResult | null> {
     const docId = this.ensureDocumentLoaded();
+    if (isProtectedDocument()) return this.saveManagedDocument();
     if (this.requiresPasswordForSave) {
       throw new Error('암호 문서의 원본 저장은 아직 지원하지 않습니다. 다른 이름으로 저장에서 암호 없는 HWP 파일로 저장하세요.');
     }
@@ -206,8 +235,13 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     return this.withDocumentOperation(() => this.saveDocumentAs());
   }
 
+  /** 새 보호 문서의 암호화 저장 위치 또는 일반 HWP 저장 위치를 선택한다. */
   private async saveDocumentAs(): Promise<DesktopSaveResult | null> {
     const docId = this.ensureDocumentLoaded();
+    if (isProtectedDocument()) {
+      if (this.sourcePath) throw new Error('기존 보호 문서는 원본 경로에 암호화 저장해 주세요.');
+      return this.saveManagedDocument();
+    }
     const targetPath = await this.selectSavePath(this.suggestedHwpName(), 'HWP 문서', ['hwp']);
     if (!targetPath) return null;
     if (this.requiresPasswordForSave) {
@@ -219,6 +253,33 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
       if (choice !== '암호 없이 저장' && choice !== 'Ok') return null;
     }
     return this.saveHwpThroughStaging(docId, this.withExtension(targetPath, 'hwp'));
+  }
+
+  /** 손실 보고서가 비어 있는 HWPX만 네이티브 암호화 채널로 보내고 성공 후 상태를 갱신한다. */
+  private async saveManagedDocument(): Promise<DesktopSaveResult | null> {
+    const docId = this.ensureDocumentLoaded();
+    const selected = this.sourcePath ?? await this.selectSavePath(
+      this.fileName.replace(/\.(hwp|hwpx)$/i, '') + '.hwpx', '암호화 HWPX 문서', ['hwpx'],
+    );
+    if (!selected) return null;
+    const targetPath = this.withExtension(selected, 'hwpx');
+    const artifact = super.exportHwpxWithReport();
+    const bytes = Array.from(artifact.bytes);
+    try {
+      const loss = artifact.contentLoss;
+      if (artifact.bytes.byteLength > 64 * 1024 * 1024 || loss.schemaVersion !== 1
+        || loss.outputFormat !== 'hwpx' || loss.count !== 0 || loss.losses.length !== 0) {
+        throw new Error('HWPX 저장 중 보존되지 않는 내용이 있어 저장을 중단했습니다.');
+      }
+      const result = await this.invoke<DesktopSaveResult>('save_managed_document', {
+        docId, targetPath, revision: this.revision, bytes,
+      });
+      this.applyNativeSaveResult(result);
+      return result;
+    } finally {
+      artifact.bytes.fill(0);
+      bytes.fill(0);
+    }
   }
 
   async exportPdfFromCommand(): Promise<string | null> {
@@ -263,7 +324,9 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     await this.invoke<void>('reveal_in_folder', { path: this.sourcePath });
   }
 
+  /** 인자 없이 최근 목록을 반환한다. 보호 창에서는 문서 경로 기록을 읽지 않는다. */
   async listRecentDocuments(): Promise<RecentDocument[]> {
+    if (isProtectedDocument()) return [];
     return this.invoke<RecentDocument[]>('list_recent_documents');
   }
 
@@ -275,7 +338,9 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     return this.invoke<string>('render_document_preview', { path });
   }
 
+  /** 인자 없이 업데이트 상태를 반환한다. 보호 창에서는 업데이트 서비스를 사용하지 않는다. */
   async getUpdateState(): Promise<DesktopUpdateState> {
+    if (isProtectedDocument()) return { status: 'idle' };
     return this.invoke<DesktopUpdateState>('get_update_state');
   }
 
@@ -462,7 +527,9 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
     }
   }
 
+  /** 종료 전 현재 문서를 저장하고 결과를 반환한다. 보호 문서는 같은 암호문 경로를 유지한다. */
   private async saveCurrentDocumentForSafety(): Promise<DesktopSaveResult | null> {
+    if (isProtectedDocument()) return this.saveDocument();
     if (this.sourceFormat === 'hwpx' || this.requiresPasswordForSave) {
       return this.saveDocumentAs();
     }

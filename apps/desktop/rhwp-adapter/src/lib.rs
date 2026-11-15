@@ -9,6 +9,14 @@ pub use rhwp::parser::extract_thumbnail_only;
 pub use rhwp::DocumentCore;
 use std::path::PathBuf;
 
+/// 입력 바이트가 상위 엔진의 형식 판별상 HWPX인지 반환한다.
+pub fn is_hwpx(bytes: &[u8]) -> bool {
+    matches!(
+        rhwp::parser::detect_format(bytes),
+        rhwp::parser::FileFormat::Hwpx
+    )
+}
+
 /// Split a paragraph for a normal HOP editing action.
 ///
 /// Upstream also accepts paragraph metadata for merge-undo restoration. That

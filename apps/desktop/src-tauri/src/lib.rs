@@ -1,15 +1,20 @@
 mod app_quit;
 mod commands;
+#[cfg(target_os = "macos")]
+mod document_safer;
 mod font_catalog;
 #[cfg(target_os = "linux")]
 mod linux_runtime;
 #[cfg(target_os = "macos")]
 mod macos_recent_documents;
+mod managed_commands;
+mod managed_document;
 #[cfg(target_os = "macos")]
 mod menu;
 mod pdf_export;
 mod pdf_font_fallbacks;
 mod pending_open;
+mod protected_window;
 mod recent_documents;
 mod state;
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
@@ -32,86 +37,126 @@ use commands::{
     record_recent_document, render_document_preview, render_page_svg, reveal_in_folder,
     take_pending_open_paths,
 };
+use managed_commands::{
+    create_managed_document, document_safer_status, open_managed_document, save_managed_document,
+};
 use state::AppState;
 use updates::{get_update_state, restart_to_apply_update, start_update_install};
 
+/// 일반 창 또는 최소 권한 보호 창을 초기화하고 플랫폼 이벤트 루프를 실행한다.
 pub fn run() {
     #[cfg(target_os = "linux")]
     linux_runtime::apply_linux_runtime_fixes();
 
-    let app = tauri::Builder::default()
+    let provider = managed_document::native_provider();
+    let protected = std::env::args_os().any(|arg| arg == "--documentsafer")
+        || provider
+            .as_ref()
+            .is_some_and(|p| p.installed() && p.automatic_encryption().unwrap_or(true));
+    let mut context = tauri::generate_context!();
+    if protected {
+        for window in &mut context.config_mut().app.windows {
+            window.create = false;
+        }
+    }
+    let builder = tauri::Builder::default()
         .enable_macos_default_menu(false)
-        .manage(AppState::default())
-        .plugin(tauri_plugin_log::Builder::new().build())
+        .manage(AppState {
+            protected,
+            managed: std::sync::Mutex::new(managed_document::ManagedDocuments::new(provider)),
+            ..Default::default()
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_store::Builder::default().build())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
-        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
-            let paths = document_paths_from_args(&args, &cwd);
-            if paths.is_empty() {
-                return;
-            }
-            #[cfg(target_os = "macos")]
-            queue_open_paths(app, paths);
-            #[cfg(not(target_os = "macos"))]
-            {
-                let app = app.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    open_paths_in_new_windows(&app, paths);
-                });
-            }
-        }))
+        .plugin(tauri_plugin_updater::Builder::new().build());
+    let builder = if protected {
+        builder
+    } else {
+        builder
+            .plugin(tauri_plugin_log::Builder::new().build())
+            .plugin(tauri_plugin_window_state::Builder::default().build())
+            .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+                let paths = document_paths_from_args(&args, &cwd);
+                if paths.is_empty() {
+                    return;
+                }
+                #[cfg(target_os = "macos")]
+                queue_open_paths(app, paths);
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        open_paths_in_new_windows(&app, paths);
+                    });
+                }
+            }))
+    };
+    let handlers: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+        document_safer_status,
+        create_managed_document,
+        open_managed_document,
+        save_managed_document,
+        create_document,
+        create_editor_window,
+        close_document,
+        mark_document_dirty,
+        render_page_svg,
+        query_document,
+        mutate_document,
+        export_pdf,
+        export_pdf_from_hwp_path,
+        print_webview,
+        destroy_current_window,
+        cancel_app_quit,
+        desktop_platform,
+        list_local_fonts,
+        read_local_font,
+        prepare_document_open,
+        open_document_tracking,
+        prepare_staged_hwp_pdf_export,
+        prepare_staged_hwp_save,
+        commit_staged_hwp_save,
+        check_external_modification,
+        take_pending_open_paths,
+        reveal_in_folder,
+        list_recent_documents,
+        clear_recent_documents,
+        record_recent_document,
+        note_finder_recent_document,
+        render_document_preview,
+        get_update_state,
+        start_update_install,
+        restart_to_apply_update,
+    ];
+    let app = builder
         .setup(|app| {
             #[cfg(target_os = "macos")]
             menu::install(app)?;
             #[cfg(not(target_os = "macos"))]
             app.set_menu(tauri::menu::Menu::new(app)?)?;
-            #[cfg(not(target_os = "macos"))]
+            if app.state::<AppState>().protected {
+                protected_window::create(app.handle())?;
+            }
             queue_open_paths(app.handle(), startup_document_paths());
             if let Some(window) = app.get_webview_window("main") {
                 windows::install_editor_window_minimum(&window);
                 windows::configure_editor_webview(app.handle(), &window);
             }
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-            updates::install_startup_update_check(app.handle());
+            if !app.state::<AppState>().protected {
+                updates::install_startup_update_check(app.handle());
+            }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            create_document,
-            create_editor_window,
-            close_document,
-            mark_document_dirty,
-            render_page_svg,
-            query_document,
-            mutate_document,
-            export_pdf,
-            export_pdf_from_hwp_path,
-            print_webview,
-            destroy_current_window,
-            cancel_app_quit,
-            desktop_platform,
-            list_local_fonts,
-            read_local_font,
-            prepare_document_open,
-            open_document_tracking,
-            prepare_staged_hwp_pdf_export,
-            prepare_staged_hwp_save,
-            commit_staged_hwp_save,
-            check_external_modification,
-            take_pending_open_paths,
-            reveal_in_folder,
-            list_recent_documents,
-            clear_recent_documents,
-            record_recent_document,
-            note_finder_recent_document,
-            render_document_preview,
-            get_update_state,
-            start_update_install,
-            restart_to_apply_update,
-        ])
-        .build(tauri::generate_context!())
+        .invoke_handler(move |invoke| {
+            if protected && !protected_window::allows_command(invoke.message.command()) {
+                invoke.resolver.reject(managed_document::RESTRICTED);
+                return true;
+            }
+            handlers(invoke)
+        })
+        .build(context)
         .expect("failed to build HOP desktop app");
 
     app.run(|_app, _event| {
@@ -186,7 +231,7 @@ fn document_paths_from_args(args: &[String], cwd: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(not(target_os = "macos"))]
+/// 명령행에서 지원 문서 경로를 추출해 최초 창의 열기 대기열에 전달한다.
 fn startup_document_paths() -> Vec<String> {
     let cwd = env::current_dir().ok();
     env::args_os()

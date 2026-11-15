@@ -1,3 +1,4 @@
+// 포함된 WASM 엔진의 문서 편집·암호 및 HWPX 메모리 왕복을 검증한다.
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
@@ -11,6 +12,27 @@ await init({ module_or_path: await readFile(
 test('shipped WASM keeps HOP document support without the unused PDF importer', () => {
   assert.equal(version(), lock.version);
   assert.equal(HwpDocument.supportsPdfImport(), false);
+});
+
+test('protected HWPX export reports no loss and preserves edits without temporary files', () => {
+  const document = HwpDocument.createEmpty();
+  let reopened;
+  let artifact;
+  let bytes;
+  try {
+    document.createBlankDocument();
+    document.insertText(0, 0, 0, 'HOP-HWPX-MEMORY-ROUNDTRIP');
+    artifact = document.exportHwpxWithReport();
+    assert.equal(JSON.parse(artifact.contentLoss()).count, 0);
+    bytes = artifact.takeBytes();
+    reopened = new HwpDocument(bytes);
+    assert.ok(reopened.getTextFileText().includes('HOP-HWPX-MEMORY-ROUNDTRIP'));
+  } finally {
+    bytes?.fill(0);
+    artifact?.free();
+    reopened?.free();
+    document.free();
+  }
 });
 
 for (const format of ['hwp', 'hwpx', 'encrypted-hwp', 'encrypted-hwpx']) {

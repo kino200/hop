@@ -8,7 +8,7 @@ use hop_rhwp_adapter::DocumentCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_fs::FsExt;
 use uuid::Uuid;
 
@@ -68,7 +68,13 @@ pub fn prepare_document_open(app: AppHandle, path: String) -> Result<(), String>
 }
 
 #[tauri::command]
+/// 문서 ID에 해당하는 보호 바이트와 일반 추적 세션을 함께 해제한다.
 pub fn close_document(doc_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .managed
+        .lock()
+        .map_err(|_| crate::managed_document::RESTRICTED)?
+        .close(&doc_id);
     state
         .sessions
         .lock()
@@ -86,7 +92,9 @@ pub fn mark_document_dirty(doc_id: String, state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
+/// 현재 정책이 평문 출력을 허용할 때만 HWP 임시 저장 경로를 반환한다.
 pub fn prepare_staged_hwp_save(app: AppHandle, target_path: String) -> Result<String, String> {
+    crate::protected_window::require_plain_output(&app)?;
     prepare_staged_file(
         &app,
         PathBuf::from(target_path),
@@ -96,10 +104,12 @@ pub fn prepare_staged_hwp_save(app: AppHandle, target_path: String) -> Result<St
 }
 
 #[tauri::command]
+/// 현재 정책을 확인하고 일반 문서의 PDF 준비 경로를 반환한다.
 pub fn prepare_staged_hwp_pdf_export(
     app: AppHandle,
     target_path: String,
 ) -> Result<String, String> {
+    crate::protected_window::require_plain_output(&app)?;
     prepare_staged_file(
         &app,
         PathBuf::from(target_path),
@@ -109,6 +119,7 @@ pub fn prepare_staged_hwp_pdf_export(
 }
 
 #[tauri::command]
+/// 저장 직전 정책을 재검사하고 일반 HWP 임시 파일을 확정한다.
 pub fn commit_staged_hwp_save(
     app: AppHandle,
     doc_id: String,
@@ -118,6 +129,7 @@ pub fn commit_staged_hwp_save(
     allow_external_overwrite: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<SaveResult, String> {
+    crate::protected_window::require_plain_output(&app)?;
     let target_path = PathBuf::from(target_path);
     let result = state
         .sessions
@@ -239,6 +251,7 @@ pub fn mutate_document(
 }
 
 #[tauri::command]
+/// 현재 정책이 허용하는 일반 문서만 PDF로 내보내고 작업 ID를 반환한다.
 pub fn export_pdf(
     app: AppHandle,
     doc_id: String,
@@ -247,6 +260,7 @@ pub fn export_pdf(
     open_after: bool,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    crate::protected_window::require_plain_output(&app)?;
     let job_id = Uuid::new_v4().to_string();
 
     let mut sessions = state
@@ -260,6 +274,7 @@ pub fn export_pdf(
 }
 
 #[tauri::command]
+/// 현재 정책이 허용할 때만 임시 HWP를 PDF로 변환하고 작업 ID를 반환한다.
 pub fn export_pdf_from_hwp_path(
     app: AppHandle,
     staged_path: String,
@@ -267,6 +282,7 @@ pub fn export_pdf_from_hwp_path(
     page_range: Option<PageRange>,
     open_after: bool,
 ) -> Result<String, String> {
+    crate::protected_window::require_plain_output(&app)?;
     let job_id = Uuid::new_v4().to_string();
 
     let staged_path = PathBuf::from(staged_path);
@@ -305,7 +321,9 @@ pub fn reveal_in_folder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+/// 출력 정책을 확인한 일반 창만 시스템 인쇄로 전달한다.
 pub fn print_webview(window: WebviewWindow) -> Result<(), String> {
+    crate::protected_window::require_plain_output(window.app_handle())?;
     window
         .print()
         .map_err(|e| format!("인쇄 대화상자를 열 수 없습니다: {}", e))

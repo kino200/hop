@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { hashBytes } from './chunked-fs';
 import { TauriBridge } from './tauri-bridge';
 
@@ -43,6 +43,8 @@ vi.mock('@/core/wasm-bridge', () => ({
     }));
     createNewDocumentMock = vi.fn(() => ({ pageCount: 1, fontsUsed: [] }));
     exportHwpMock = vi.fn(() => new Uint8Array([1, 2, 3]));
+    exportHwpxMock = vi.fn(() => ({ bytes: new Uint8Array([80, 75, 3, 4]), contentLoss: { schemaVersion: 1, outputFormat: 'hwpx', count: 0, losses: [] } }));
+    exportHwpxWithReport() { return this.exportHwpxMock(); }
     sourceFormat = 'hwp';
     requiresPasswordForSave = false;
 
@@ -67,11 +69,79 @@ vi.mock('@/core/wasm-bridge', () => ({
 
 describe('TauriBridge', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
     setTitleMock.mockReset().mockResolvedValue(undefined);
     (globalThis as { document?: { title: string } }).document = { title: '' };
     statMock.mockResolvedValue({ size: 3, isFile: true, mtime: new Date('2026-04-23T00:00:00.000Z') });
     removeMock.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('loads protected bytes without filesystem, recent documents, or plaintext staging', async () => {
+    vi.stubGlobal('window', { __HOP_PROTECTED__: true });
+    const bridge = new TauriBridge();
+    const values = [80, 75, 3, 4];
+    invokeMock.mockResolvedValue({ document: nativeOpenResult({ fileName: 'secret.hwpx', format: 'hwpx' }), bytes: values, redirected: false });
+    expect((await bridge.openDocumentByPath('/tmp/secret.hwpx'))?.message).toContain('보호 문서');
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(fsOpenMock).not.toHaveBeenCalled();
+    expect(values).toEqual([0, 0, 0, 0]);
+    expect(bridge.getSourceFormat()).toBe('hwpx');
+  });
+
+  it('redirects encrypted input from ordinary windows without reading its body', async () => {
+    const bridge = new TauriBridge();
+    invokeMock.mockResolvedValue({ redirected: true, bytes: [] });
+    expect(await bridge.openDocumentByPath('/tmp/secret.hwpx')).toBeNull();
+    expect(fsOpenMock).not.toHaveBeenCalled();
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates and saves new protected HWPX through memory IPC only', async () => {
+    vi.stubGlobal('window', { __HOP_PROTECTED__: true });
+    const bridge = new TauriBridge();
+    saveMock.mockResolvedValue('/tmp/new.hwpx');
+    invokeMock.mockImplementation(async (command: string, args: Record<string, unknown>) => {
+      if (command === 'create_managed_document') return nativeOpenResult({ sourcePath: null, fileName: 'new.hwpx', format: 'hwpx' });
+      if (command === 'save_managed_document') {
+        expect(args.bytes).toEqual([80, 75, 3, 4]);
+        return { ...nativeOpenResult({ sourcePath: '/tmp/new.hwpx', format: 'hwpx' }), revision: 2 };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+    await bridge.createNewDocumentAsync();
+    await bridge.saveDocumentFromCommand();
+    expect(fsOpenMock).not.toHaveBeenCalled();
+    expect(removeMock).not.toHaveBeenCalled();
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(bridge.hasUnsavedChanges()).toBe(false);
+    expect(await bridge.listRecentDocuments()).toEqual([]);
+    expect(await bridge.getUpdateState()).toEqual({ status: 'idle' });
+  });
+
+  it('keeps dirty state on encryption denial and rejects protected Save As', async () => {
+    vi.stubGlobal('window', { __HOP_PROTECTED__: true });
+    const bridge = new TauriBridge();
+    applyOpenResult(bridge, nativeOpenResult({ sourcePath: '/tmp/secret.hwpx', fileName: 'secret.hwpx', format: 'hwpx', dirty: true }));
+    invokeMock.mockRejectedValue(new Error('policy denied'));
+    await expect(bridge.saveDocumentFromCommand()).rejects.toThrow('policy denied');
+    expect(bridge.hasUnsavedChanges()).toBe(true);
+    expect(fsOpenMock).not.toHaveBeenCalled();
+    await expect(bridge.saveDocumentAsFromCommand()).rejects.toThrow('원본 경로');
+    expect(saveMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses lossy HWPX before requesting encryption', async () => {
+    vi.stubGlobal('window', { __HOP_PROTECTED__: true });
+    const bridge = new TauriBridge();
+    applyOpenResult(bridge, nativeOpenResult({ format: 'hwpx', dirty: true }));
+    (bridge as unknown as { exportHwpxMock: ReturnType<typeof vi.fn> }).exportHwpxMock.mockReturnValue({
+      bytes: new Uint8Array([80, 75]), contentLoss: { schemaVersion: 1, outputFormat: 'hwpx', count: 1, losses: [{}] },
+    });
+    await expect(bridge.saveDocumentFromCommand()).rejects.toThrow('보존되지 않는 내용');
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(bridge.hasUnsavedChanges()).toBe(true);
   });
 
   it('opens a native document by path, mirrors bytes into wasm, and updates title state', async () => {
@@ -86,7 +156,7 @@ describe('TauriBridge', () => {
 
     const loaded = await bridge.openDocumentByPath('/tmp/opened.hwp');
 
-    expect(invokeMock).toHaveBeenNthCalledWith(1, 'prepare_document_open', {
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'prepare_document_open', {
       path: '/tmp/opened.hwp',
     });
     expect(fsOpenMock).toHaveBeenCalledWith('/tmp/opened.hwp', { read: true });
@@ -257,7 +327,7 @@ describe('TauriBridge', () => {
       '파일을 읽는 중 변경되었습니다. 다시 시도하세요.',
     );
 
-    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledTimes(2);
     expect(invokeMock).toHaveBeenCalledWith('prepare_document_open', { path: '/tmp/changing.hwp' });
     expect(invokeMock).not.toHaveBeenCalledWith('open_document_tracking', expect.anything());
   });
@@ -269,6 +339,7 @@ describe('TauriBridge', () => {
     });
     fsOpenMock.mockResolvedValue(readHandle([1]));
     invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'open_managed_document') return null;
       if (command === 'prepare_document_open') return undefined;
       if (command === 'open_document_tracking') return nativeOpenResult({ docId: 'doc-bad', fileName: 'bad.hwp' });
       if (command === 'close_document') return undefined;
@@ -286,6 +357,7 @@ describe('TauriBridge', () => {
       .mockResolvedValueOnce(readHandle([1]))
       .mockResolvedValueOnce(readHandle([2]));
     invokeMock.mockImplementation(async (command: string, args: Record<string, unknown>) => {
+      if (command === 'open_managed_document') return null;
       if (command === 'prepare_document_open') return undefined;
       if (command === 'note_finder_recent_document') return undefined;
       if (command === 'record_recent_document') return undefined;
@@ -346,6 +418,7 @@ describe('TauriBridge', () => {
     const bridge = new TauriBridge();
     fsOpenMock.mockResolvedValue(readHandle([4, 5, 6]));
     invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'open_managed_document') return null;
       if (command === 'prepare_document_open') return undefined;
       if (command === 'open_document_tracking') {
         return nativeOpenResult({
@@ -382,6 +455,7 @@ describe('TauriBridge', () => {
     const bridge = new TauriBridge();
     fsOpenMock.mockResolvedValue(readHandle([0x50, 0x4b, 0x03, 0x04]));
     invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'open_managed_document') return null;
       if (command === 'prepare_document_open') return undefined;
       if (command === 'open_document_tracking') {
         return nativeOpenResult({
